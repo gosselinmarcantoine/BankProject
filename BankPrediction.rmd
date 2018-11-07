@@ -1,0 +1,195 @@
+---
+title: "BankPrediction"
+author: "Marc-Antoine Gosselin"
+date: "11/5/2018"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+# Bank Predictions
+
+To run this code, users should have the following packages installed:
+```{r Packages, eval = FALSE, warning=FALSE, message=FALSE}
+install.packages("caret")
+install.packages("tidyverse")
+install.packages("purrr")
+install.pacakges("corrplot")
+install.packages("VIM")
+install.packages("dummies")
+install.packages("rpart")
+```
+
+```{r loading train data, echo=FALSE, warning=FALSE, message=FALSE}
+bank <- read.csv("bank_traindata.csv")
+```
+
+## Data Exploration
+```{r, warning=FALSE, message=FALSE}
+head(bank)
+sum(bank$y == "yes") / nrow(bank) # for reference in prediction validation
+```
+
+Two variables are worrisome: pdays because 999 is an imputed value for NA, and duration since the dataset's readme mentions it "should be discarded if the intention is to have a realistic predictive model". The readme file also mentions: "Missing Attribute Values: There are several missing values in some categorical attributes, all coded with the "unknown" label. These missing values can be treated as a possible class label or using deletion or imputation techniques". I will investigate treating the 'unknown' variable as a category, and the imputation techniques.
+
+```{r NA investigation, warning=FALSE, message=FALSE, echo=FALSE}
+bank_NA <- bank
+bank_NA$pdays <- ifelse(bank_NA$pdays == 999, NA, bank_NA$pdays)
+
+# Bank_known will be the dataset for NA imputation.
+bank_NA[bank_NA == "unknown"] = NA
+
+library(purrr)
+map_dbl(bank_NA, ~sum(is.na(.))/nrow(bank_NA)) # percent of missing values per variable.
+map_dbl(bank_NA, ~ length(unique(.))) # number of unique values per variable. 1 value entails that the variable does not provide any information for model training. 
+```
+
+We'll remove pdays because it has less than 4% non NAs, and duration as recommended in readme.
+```{r, echo=FALSE, warning=FALSE, message=FALSE}
+bank <- subset(bank, select = c(-pdays, -duration))
+```
+
+Now that we have explored and cleaned our data a little, we could proceed to impute missing values. The following code imputes missing values using the kNN imputation technique. However, the techinque takes several minutes to run and only barely improves our modeling accuracy. If you would like to impute the missing values nonetheless, you can change "eval = FALSE" to "eval = TRUE" in the markdown code chunk titled "kNN Imputation" before knitting it.
+```{r kNN Imputation, warning=FALSE, message=FALSE, eval=FALSE}
+
+bank$pdays <- ifelse(bank$pdays == 999, NA, bank$pdays)
+bank[bank == "unknown"] = NA
+
+library(VIM)
+bank <- kNN(bank, variable = c("job", "marital", "education", "default", "housing", "loan"), imp_var = FALSE)
+
+# For bank_test prediction
+bank_test$pdays <- ifelse(bank_test$pdays == 999, NA, bank_test$pdays)
+bank_test[bank_test == "unknown"] = NA
+bank_test <- subset(bank_test, select = c(-pdays, -duration))
+bank_test <- kNN(bank_test, variable = c("job", "marital", "education", "default", "housing", "loan"), imp_var = FALSE)
+```
+
+
+Let's look into the collinearity of the variables.
+
+```{r Multi-variate Collinearity, echo=FALSE, warning=FALSE, message=FALSE}
+ranked_bank <- map_dfc(bank, rank)
+corrplot::corrplot(cor(ranked_bank, method = "spearman"), method = "square", type = "lower")
+rm(ranked_bank)
+```
+
+We can see some collinearity between some of the variables. Since we also have a good number of variables, our dataset appears to be a good candidate for PCA. In fact, modeling without PCA leads to difficult problems. 
+
+# Pre-processing for PCA
+
+PCA only manages numerical data and is an unsupervised technique so we must remove the dependent variable y and convert non-numeric variables into dummy variables.
+```{r pre-processing for PCA, warning=FALSE, message=FALSE}
+#removing the response variable
+vars <- subset(bank, select = -y)
+
+# Converting factor class variables into dummies for PCA
+library(dummies)
+
+str(vars)
+dummy_vars <- dummy.data.frame(vars, names = c("job", "marital", "education", "default", "housing", "loan", "contact", "month", "day_of_week", "poutcome"), drop = FALSE)
+```
+
+#PCA
+
+```{r PCA, warning=FALSE, message=FALSE}
+components <- prcomp(dummy_vars, scale = T) 
+```
+
+```{r Scree plots (hard coding), warning=FALSE, message=FALSE}
+std_dev <- components$sdev
+pr_var <- std_dev^2
+prop_varex <- pr_var/sum(pr_var)
+plot(prop_varex, xlab = "Principal Component",
+     ylab = "Proportion of Variance Explained",
+     type = "b")
+
+# Cumulative scree plot
+plot(cumsum(prop_varex), xlab = "Principal Component",
+     ylab = "Cumulative Proportion of Variance Explained",
+     type = "b")
+```
+
+Looking at the scree plots, it is not obvious where we should make the cutoff for analysis. Here we will take the 40 first components leaving us a good margin to guard against overfitting. 
+
+```{r preproccessing pca for modeling, warning=FALSE, message=FALSE}
+# Adding back the response variable
+bank_tr_predict <- data.frame(y = bank$y, components$x)
+
+# We are interested in first 40 PCAs (from scree plot)
+bank_tr_predict <- bank_tr_predict[,1:41] # 41 counting y col
+```
+
+```{r modeling, warning=FALSE, message=FALSE}
+library(caret)
+control <- trainControl(method="cv", number=10) # K-fold Cross validation
+
+# Run a model
+fit.lda <- train(y ~ ., 
+                 data = bank_tr_predict, 
+                 method = "lda", 
+                 metric = "Accuracy", 
+                 trControl = control)
+fit.cart <- train(y ~ ., 
+                  data = bank_tr_predict, 
+                  method = "rpart", 
+                  metric = "Accuracy", 
+                  trControl = control)
+fit.knn <- train(y ~ ., 
+                 data = bank_tr_predict, 
+                 method = "knn", 
+                 metric = "Accuracy", 
+                 trControl = control)
+
+# The SVM and Random Forest techniques are too complex for my computer.
+
+(results <- resamples(list(lda = fit.lda, 
+                           cart = fit.cart, 
+                           knn = fit.knn)))
+summary(results)
+```
+
+It would seem that lda has a slightly worse accuracy than cart and knn, but is generally not as affected by the Kappa error penalty. This could mean that it performs better in regards to type 1 and type 2 error. Unfortunately, running the confusion matrices for the different methods, we can see that while lda does correctly assign more y = "yes", it also makes more type 1 and 2 errors. For that reason, we will proceed with the rpart model.
+
+```{r bank_test Prediction, warning=FALSE, message=FALSE}
+# Formatting bank_test
+bank_test <- read.csv("bank_testdata.csv")
+library(tidyverse)
+
+bank_test <- subset(bank_test, select = c(-pdays, -duration))
+bank_test <- select(bank_test, -y)
+levels(bank_test$default) <- c("yes", "no", "unknown")
+test_dummy <- dummy.data.frame(bank_test, names = c("job", "marital", "education", "default", "housing", "loan", "contact", "month", "day_of_week", "poutcome"), drop = FALSE)
+
+# Run bank_test obs. through PCA
+pred <- predict(components, newdata = test_dummy)
+pred <- as.data.frame(pred)
+
+# Select the first 40 components
+pred <- pred[,1:40]
+
+# Make prediction for bank_test
+prediction <- predict(fit.cart, pred)
+prediction <- as.data.frame(prediction)
+bank_prediction <- cbind(bank_test, prediction)
+
+sum(bank_prediction$prediction == "yes") /nrow(prediction)
+sum(bank$y == "yes") / nrow(bank) # for reference in prediction validation
+```
+We predict 745 of the obs. will have y = "yes". This is close to the 0.1126521 probability of y being "yes" from the training dataset so we are comfident in our prediction.
+
+```{r bank_test prediction validation, warning=FALSE, message=FALSE}
+ans <- read.csv("bank_testans.csv")
+
+head(bank_prediction)
+head(bank_ans)
+testing_df <- cbind(select(bank_prediction, prediction), select(bank_ans, y))
+testing_df <- testing_df %>% mutate(correct = ifelse(prediction == y, 1, 0))
+
+# How good were our predictions?
+sum(testing_df$correct)/nrow(testing_df)
+confusionMatrix(testing_df$prediction, testing_df$y)
+```
+
